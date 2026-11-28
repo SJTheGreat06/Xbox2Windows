@@ -1,0 +1,1 @@
+tests/startup_compile_sampled_pixel_request_cli_check.py

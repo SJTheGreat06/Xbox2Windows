@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import re
 import subprocess
+import sys
 from tempfile import TemporaryDirectory
 
 import gfx2hlsl as gfx
@@ -23,16 +24,25 @@ def bindings(lines, sampler_tags):
 
 
 def write_program(path, container):
+    if not container:
+        raise ValueError('empty graphics program')
     raw = gfx.strip_header(container)
+    if not raw:
+        raise ValueError('empty graphics program')
     instructions = gfx.decode(raw)
     if not instructions or instructions[-1][2] != 's_endpgm':
         raise ValueError('missing program boundary')
     end, size, _, _ = instructions[-1]
+    if end < 0 or size <= 0 or end + size > len(raw):
+        raise ValueError('invalid program span')
     path.write_bytes(raw[:end + size])
     return len(container) - len(raw)
 
 
 def build(marker, dest, compiler, sdk, cache, buffered_vertex=False):
+    marker = Path(marker)
+    dest = Path(dest)
+    _validate_paths(marker, dest, Path(compiler), Path(sdk), Path(cache))
     match = re.fullmatch(r'req_([0-9a-f]{16})\.rtv', marker.name)
     if not match:
         raise ValueError('expected a req_<16 hex digits>.rtv marker')
@@ -43,6 +53,11 @@ def build(marker, dest, compiler, sdk, cache, buffered_vertex=False):
         raise ValueError('expected a matching ' + ('RGBA16_FLOAT' if buffered_vertex else 'R11G11B10_FLOAT / R16_FLOAT') + ' request')
     base = int(parsed[1])
     stem = f'req_{base:016x}'
+    for suffix in ('.a', '.b', '.root', '.ia'):
+        companion = marker.with_name(stem + suffix)
+        if companion.is_symlink() or (companion.exists() and not companion.is_file()) or (
+                suffix != '.ia' and not companion.exists()):
+            raise ValueError(f'missing or non-regular companion file {companion.name}')
     dest.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(dir=dest) as temp:
         bundle = Path(temp) / 'bundle'
@@ -115,20 +130,52 @@ def build(marker, dest, compiler, sdk, cache, buffered_vertex=False):
         try:
             bundle.rename(output)
         except OSError:
-            if not output.is_dir() or (output / 'replay.json').read_bytes() != record:
+            if not output.is_dir() or output.is_symlink():
                 raise
+            replay_path = output / 'replay.json'
+            if replay_path.is_symlink() or not replay_path.is_file() or replay_path.read_bytes() != record:
+                raise ValueError('damaged replay bundle: replay.json')
             for path, expected in metadata['sha256'].items():
-                if hashlib.sha256((output / path).read_bytes()).hexdigest() != expected:
+                target = output / path
+                if target.is_symlink() or not target.is_file():
+                    raise ValueError('damaged replay bundle: ' + path)
+                if hashlib.sha256(target.read_bytes()).hexdigest() != expected:
                     raise ValueError('damaged replay bundle: ' + path)
         return output
 
 
-if __name__ == '__main__':
+def _validate_paths(marker, dest, compiler, sdk, cache):
+    """Refuse missing or hostile inputs and outputs before anything is read or created."""
+    if marker.is_symlink() or not marker.is_file():
+        raise ValueError(f'marker is not an existing file: {marker}')
+    if not compiler.is_file():
+        raise ValueError(f'compiler is not an existing file: {compiler}')
+    if not sdk.is_dir():
+        raise ValueError(f'sdk is not an existing directory: {sdk}')
+    for label, path in (('output', dest), ('cache', cache)):
+        if path.is_symlink():
+            raise ValueError(f'{label} path is a symbolic link: {path}')
+        if path.is_file():
+            raise ValueError(f'{label} path is an existing regular file: {path}')
+        if path.exists() and not path.is_dir():
+            raise ValueError(f'{label} path is not a directory: {path}')
+
+
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('marker', type=Path)
     parser.add_argument('output', type=Path)
     parser.add_argument('--buffered-vertex', action='store_true', help='translate a raw buffered VS with an RGBA16_FLOAT pixel companion')
     for option in ('compiler', 'sdk', 'cache'):
         parser.add_argument('--' + option, type=Path, required=True)
-    args = parser.parse_args()
-    print(build(args.marker, args.output, args.compiler, args.sdk, args.cache, args.buffered_vertex))
+    args = parser.parse_args(argv)
+    try:
+        print(build(args.marker, args.output, args.compiler, args.sdk, args.cache, args.buffered_vertex))
+    except (OSError, ValueError, gfx.Unsupported, subprocess.CalledProcessError) as error:
+        print(f'error: {error}', file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

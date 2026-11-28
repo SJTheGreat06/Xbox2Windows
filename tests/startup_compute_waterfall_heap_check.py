@@ -11,9 +11,11 @@ Covers:
    waterfall loops, including both direct heap offsets (s_lshl_b32 + s_load_dwordx4 s[...], s[8:9], sI)
    and the adjacent 64-bit pointer-add carry form (s_add_u32 + s_add_u32 0, src_scc / s_addc_u32, with
    either in-body s_lshl_b32 or pre-loop v_lshlrev_b32 ..., 5), plus v_min_u32 and v_bfe_u32 bounds.
-2. Soundness negative controls: unbounded keys, oversized masks, one-arm diamond bounds, bounded writes under
-   narrowed EXEC, missing/wrong shift, missing resheap root flag, non-zero high word, broken carry, descriptor
-   mutation, exit-live scalars, and forbidden store/formatted/idxen uses.
+2. Soundness negative controls: unbounded keys (including an unbounded `v_mov_b32` copy), oversized masks,
+   one-arm diamond bounds, bounded writes under narrowed EXEC, missing/wrong shift, missing resheap root flag,
+   non-zero high word, broken carry, descriptor mutation, exit-live scalars, forbidden store/formatted/idxen uses,
+   and a per-lane index expression that still names an SGPR. An index SGPR overwritten after its mark keeps the
+   mark-time key. `v_lshrrev_b32` bounds declare an exact `rh[N]`.
 3. Independent DXIL handle metadata assertions via DXC cs_6_0: confirms the resource handle selects SRV space 2
    [0..3] with nonUniformIndex=true, and that stripping NonUniformResourceIndex changes it to false.
 4. Four-record GPU oracle (--oracle): reference, static switch, no-marker, and first-active (asserting the
@@ -108,6 +110,11 @@ ENCODINGS = {
     's_nop 0': '000080bf',
     's_or_b32 s31, s31, 0': '1f801f88',
     's_mov_b32 s22, 0': '800396be',
+    's_mov_b32 s24, 0': '800398be',
+    's_lshl_b32 s23, s24, 5': '1885178f',
+    'v_mov_b32_e32 v5, v9': '09030a7e',
+    'v_lshrrev_b32_e32 v5, 1, v5': '810a0a2c',
+    'v_lshrrev_b32_e32 v5, 22, v5': '960a0a2c',
     'v_mov_b32_e32 v7, s22': '16020e7e',
     'v_mov_b32_e32 v7, s28': '1c020e7e',
     'buffer_load_dword v7, v4, s[28:31], 0 idxen': '002030e004070780',
@@ -159,6 +166,18 @@ ORACLE_ROWS = ((0, 1, 2, 3), (3, 2, 1, 0), (2, 1, 2, 3), (4, 9, 14, 19), (7, 7, 
 
 def row_pair(asm):
     return (asm, ENCODINGS[asm])
+
+
+def assert_pinned_index(hlsl, manifest, assignment, clobber=None, records='resheap 4 2'):
+    """The load reads the index copied at the mark, not an SGPR written later."""
+    lines = [ln.strip() for ln in hlsl.splitlines()]
+    assert assignment in lines, hlsl
+    assert 'rh[NonUniformResourceIndex(h0)].Load(a + 0)' in hlsl
+    assert manifest.endswith(records + '\n'), manifest
+    if clobber is not None:
+        assert clobber in lines, hlsl
+        assert lines.index(assignment) < lines.index(clobber)
+        assert not any(ln.startswith('h0 =') for ln in lines[lines.index(clobber) + 1:]), lines
 
 
 def build_program(*, bound=(MASK_AND3,), init=INIT_AND_GUARD, body=(SHIFT5, HEAP_LOAD, WAIT_LGKM, BODY_LOAD, WAIT_VM),
@@ -265,7 +284,8 @@ def check_translator(llvm_mc=None):
     hlsl_inp, _ = translate(build_program(body=(row_pair('s_lshl_b32 s22, s22, 5'),
                                                 row_pair('s_load_dwordx4 s[28:31], s[8:9], s22'),
                                                 WAIT_LGKM, BODY_LOAD, WAIT_VM)))
-    assert 'h0 = (s22 >> 5);' in hlsl_inp
+    # The key is copied at v_readfirstlane, before the in-place shift replaces s22.
+    assert 'h0 = s22;' in hlsl_inp and hlsl_inp.index('h0 = s22;') < hlsl_inp.index('s22 = s22 <<')
     hlsl_reused, _ = translate(build_program(body=(SHIFT5, HEAP_LOAD, WAIT_LGKM, row_pair('s_mov_b32 s22, 0'),
                                                    BODY_LOAD, WAIT_VM)))
     assert 'h0 = s22;' in hlsl_reused and 'rh[NonUniformResourceIndex(h0)].Load' in hlsl_reused
@@ -274,9 +294,36 @@ def check_translator(llvm_mc=None):
                                                  WAIT_LGKM, BODY_LOAD, WAIT_VM)))
     assert 'h0 = s22;' in hlsl_ocpy
 
+    # An emitted write of the index SGPR between the mark and the load keeps the mark-time key.
+    zero22 = 's22 = 0x00000000u;'
+    assert_pinned_index(*translate(build_program(body=(SHIFT5, row_pair('s_mov_b32 s22, 0'), HEAP_LOAD,
+                                                       WAIT_LGKM, BODY_LOAD, WAIT_VM))),
+                        'h0 = s22;', zero22)
+    assert_pinned_index(*translate(build_program(
+        bound=(MASK_AND3, row_pair('v_lshlrev_b32_e32 v5, 5, v5')),
+        body=(*CARRY_ADD_S22[:2], row_pair('s_mov_b32 s22, 0'), CARRY_ADD_S22[2], WAIT_LGKM, BODY_LOAD, WAIT_VM))),
+        'h0 = (s22 >> 5);', zero22)
+    assert_pinned_index(*translate(build_program(body=(
+        row_pair('s_lshl_b32 s22, s22, 5'), row_pair('s_mov_b32 s24, s22'), row_pair('s_mov_b32 s22, 0'),
+        row_pair('s_load_dwordx4 s[28:31], s[8:9], s24'), WAIT_LGKM, BODY_LOAD, WAIT_VM))),
+        'h0 = s22;', zero22)
+    assert_pinned_index(*translate(build_program(body=(
+        row_pair('s_mov_b32 s24, s22'), row_pair('s_lshl_b32 s23, s24, 5'), row_pair('s_mov_b32 s24, 0'),
+        HEAP_LOAD, WAIT_LGKM, BODY_LOAD, WAIT_VM))),
+        'h0 = s22;', 's24 = 0x00000000u;')
+
+    # v_lshrrev bounds: a bounded source shifts the max index, and a wide source is 0xffffffff >> shift.
+    hlsl_shr, man_shr = translate(build_program(bound=(MASK_AND3, row_pair('v_lshrrev_b32_e32 v5, 1, v5'))))
+    assert 'ByteAddressBuffer rh[2] : register(t0, space2);' in hlsl_shr and man_shr.endswith('resheap 2 2\n')
+    hlsl_wide, man_wide = translate(build_program(bound=(row_pair('v_lshrrev_b32_e32 v5, 22, v5'),)))
+    assert 'ByteAddressBuffer rh[1024] : register(t0, space2);' in hlsl_wide
+    assert man_wide.endswith('resheap 1024 2\n'), man_wide
+
     # Negative controls: every missing proof or forbidden extension stays refused.
     controls = (
         ('unbounded key', build_program(bound=()), 'per-lane descriptor selection requires a proven bound heap range'),
+        ('unbounded v_mov copy', build_program(bound=(row_pair('v_mov_b32_e32 v5, v9'),)),
+         'per-lane descriptor selection requires a proven bound heap range'),
         ('oversized mask', build_program(bound=(row_pair('v_and_b32_e32 v5, 0x7ff, v5'),)),
          'per-lane descriptor selection requires a proven bound heap range'),
         ('only one diamond arm bounds key',
@@ -336,6 +383,11 @@ def check_translator(llvm_mc=None):
             raise AssertionError(f'{label}: {err}') from None
     refused('per-lane descriptor selection requires a proven bound heap range',
             lambda: translate(build_program(), root=H.root_blob(flags=0)))
+    # The load must not fall back to a raw SGPR name: that reads whatever the register holds now.
+    def stale_capture():
+        stage = G.ComputePipeline(assemble_rows(build_program()), H.root_blob(), H.RSRC2, GROUP).cs
+        stage._capture_resheap_desc(('s', 28, 31), 's22', 3)
+    refused('per-lane resource heap index overwritten before the load', stale_capture)
 
     # Check binary reassembly against llvm-mc if provided.
     checked_asm = 0
@@ -349,7 +401,7 @@ def check_translator(llvm_mc=None):
                 got = assemble(llvm_mc, asm + '\n')
                 assert got == bytes.fromhex(hexcode), f'{asm}: {got.hex()} != {hexcode}'
                 checked_asm += 1
-    print(f'startup_compute_waterfall_heap: PASS (translator + {len(controls) + 1} refused controls'
+    print(f'startup_compute_waterfall_heap: PASS (translator + {len(controls) + 2} refused controls'
           + (f' + {checked_asm} llvm-mc encodings' if checked_asm else '') + ')')
 
 

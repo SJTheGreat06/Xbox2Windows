@@ -4878,6 +4878,7 @@ class Stage:
             self.uniform_vaddr = '(%s)' % exprs[vaddr[1]] if vaddr and vaddr[1] in exprs else None
             self.uniform_temps = {}
         self.last_v = None
+        wrote = ()
         if hasattr(self, 'heap_index'):  # unit probes build a Stage without the tracking state
             # Any write ends a register's mark; the lowering below sets the new one, if any.
             wrote = scalar_destinations(name, asm)
@@ -4891,6 +4892,8 @@ class Stage:
         finally:
             temps = getattr(self, 'uniform_temps', None)
             self.uniform_vaddr = self.uniform_temps = None
+        if wrote:
+            self._refuse_overwritten_per_lane(wrote)
         uniform_written = self._uniform_written
         if self.tracks_uniformity() and getattr(self, 'since_join', None) is not None and wrote_s:
             self.since_join -= (wrote_s - uniform_written)
@@ -6284,14 +6287,28 @@ class Stage:
                 self.heap_index[d] = ('buffer',) + word[1:]
             elif per_lane is not None:
                 expr, bound = per_lane
-                self.heap_index[d] = ('per_lane', ('(s%d >> 5)' % d) if d == r[1] else expr, bound)
+                # An in-place shift has already replaced sD. The index is that word shifted back, unless a
+                # temporary already holds the mark-time key.
+                if not re.fullmatch(r'h\d+', expr) and d == r[1]:
+                    if expr != 's%d' % d:
+                        raise Unsupported('per-lane resource heap index overwritten before the load')
+                    expr = '(s%d >> 5)' % d
+                self.heap_index[d] = ('per_lane', self._pin_resheap_index(expr), bound)
         elif base == 's_mov_b32' and len(srcs) == 1 and r and r[0] == 's' and r[1] == r[2]:
             word = {**self.heap_index, **self.heap_index_was}.get(r[1])
             per_lane = {**getattr(self, 'per_lane_index', {}), **getattr(self, 'per_lane_index_was', {})}.get(r[1])
             if word and word[0] == 'per_lane':
-                self.heap_index[d] = word
+                expr = word[1]
+                if not re.fullmatch(r'h\d+', expr) and re.search(r'\bs%d\b' % d, expr):
+                    raise Unsupported('per-lane resource heap index overwritten before the load')
+                self.heap_index[d] = ('per_lane', self._pin_resheap_index(expr), word[2])
             elif per_lane is not None:
-                self.per_lane_index[d] = ('s%d' % d, per_lane[1])
+                expr, bound = per_lane
+                if not re.fullmatch(r'h\d+', expr):
+                    if re.search(r'\bs%d\b' % d, expr) and r[1] != d:
+                        raise Unsupported('per-lane resource heap index overwritten before the load')
+                    expr = self._pin_resheap_index('s%d' % d)
+                self.per_lane_index[d] = (expr, bound)
         elif base in ('s_add_u32', 's_add_i32', 's_mul_i32') and len(srcs) == 2:
             for i in (0, 1):
                 k = lit[1 - i]
@@ -6914,13 +6931,43 @@ class Stage:
             return self.heap_record(dst, base, token, imm, count)
         raise Unsupported('s_load with a register offset through %s' % (p[1],))
 
-    def _capture_resheap_desc(self, dst, expr, bound):
+    def _pin_resheap_index(self, expr):
+        """Copy a per-lane heap index where its mark is made, not at the s_load.
+
+        The load used to read the SGPR name, so a write of that SGPR before the load selected record 0.
+        A temporary already captured (hN) is kept. The load refuses an expression that still names an SGPR.
+        """
+        if re.fullmatch(r'h\d+', expr or ''):
+            return expr
         if not hasattr(self, 'resheap_index_temps'):
             self.resheap_index_temps = []
         temp = 'h%d' % len(self.resheap_index_temps)
         self.resheap_index_temps.append(temp)
         self.emit('%s = %s;' % (temp, expr))
-        source = ('resheap', 'per_lane', temp, bound)
+        return temp
+
+    def _refuse_overwritten_per_lane(self, wrote):
+        """Refuse a per-lane index expression that still names an SGPR this instruction wrote."""
+        def stale(expr):
+            if not isinstance(expr, str) or re.fullmatch(r'h\d+', expr):
+                return False
+            if 'any' in wrote:
+                return re.search(r'\bs\d+\b', expr) is not None
+            return any(isinstance(n, int) and re.search(r'\bs%d\b' % n, expr) for n in wrote)
+
+        for mark in self.heap_index.values():
+            if isinstance(mark, tuple) and mark and mark[0] == 'per_lane' and len(mark) > 1 and stale(mark[1]):
+                raise Unsupported('per-lane resource heap index overwritten before the load')
+        for item in getattr(self, 'per_lane_index', {}).values():
+            if item and stale(item[0]):
+                raise Unsupported('per-lane resource heap index overwritten before the load')
+
+    def _capture_resheap_desc(self, dst, expr, bound):
+        if not re.fullmatch(r'h\d+', expr or ''):
+            if re.search(r'\bs\d+\b', expr or ''):
+                raise Unsupported('per-lane resource heap index overwritten before the load')
+            expr = self._pin_resheap_index(expr)
+        source = ('resheap', 'per_lane', expr, bound)
         for i in range(4):
             self.sym[dst[1] + i] = ('desc', source, 0, i)
 
@@ -9321,10 +9368,12 @@ class Stage:
             self.set_s(dst[1], self.u(ops[1]), uniform=False)  # the selected key varies between lanes
             bound = getattr(self, 'waterfall_heap_bounds', {}).get(self.pc)
             if bound:
+                # Snapshot the key now. A later write of this SGPR must not change the record the load reads.
                 if bound[0] == 'idx':
-                    self.per_lane_index[dst[1]] = ('s%d' % dst[1], bound[1])
+                    self.per_lane_index[dst[1]] = (self._pin_resheap_index('s%d' % dst[1]), bound[1])
                 elif bound[0] == 'off5':
-                    self.heap_index[dst[1]] = ('per_lane', '(s%d >> 5)' % dst[1], bound[1])
+                    pinned = self._pin_resheap_index('(s%d >> 5)' % dst[1])
+                    self.heap_index[dst[1]] = ('per_lane', pinned, bound[1])
             return
         if (mods or not dst or dst[0] != 's' or dst[1] != dst[2] or
                 not src or src[0] != 'v' or src[1] != src[2] or not self.proven_uniform_v(src[1])):

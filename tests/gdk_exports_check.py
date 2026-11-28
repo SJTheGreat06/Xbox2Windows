@@ -6,6 +6,7 @@ nor the GDK; the PE scanner is a thin wrapper over pefile and is exercised by
 the real inventory outside the repository.
 """
 
+import hashlib
 import json
 import sys
 import tempfile
@@ -64,6 +65,17 @@ def check_parse():
         {"ordinal": None, "name": "XMemFree", "rva": None},
         {"ordinal": None, "name": "?XMemInternal@@YAXXZ", "rva": None},
     ], f"LIB parse {lib}")
+    for marker in ("Summary", "Dump of file another.lib"):
+        capture = (
+            "Exports\nordinal name\n1 BeforeMarker\n"
+            + marker
+            + "\n2 AfterMarker\n"
+        )
+        parsed = exports.parse_dumpbin_text(capture)
+        check(
+            [item["name"] for item in parsed] == ["BeforeMarker"],
+            f"parser continued past {marker}: {parsed}",
+        )
 
     with tempfile.TemporaryDirectory() as directory:
         directory = Path(directory)
@@ -79,7 +91,12 @@ def check_parse():
         check(document["sdk"] == "999", f"sdk {document['sdk']}")
         check(document["modules"][0]["module"] == "xg_xs", f"module {document['modules'][0]['module']}")
         check(document["modules"][0]["sdk"] == "999", f"module sdk {document['modules'][0]['sdk']}")
-        check(len(document["modules"][0]["sha256"]) == 64, "sha256")
+        expected_hash = hashlib.sha256(source.read_bytes()).hexdigest().upper()
+        check(document["modules"][0]["sha256"] == expected_hash, "capture sha256")
+        lib_capture = directory / "d3d12_xs.lib.txt"
+        lib_capture.write_text(LIB_TEXT, encoding="utf-8")
+        collected = exports.collect_dumpbin(lib_capture, "lib")
+        check(collected[0]["module"] == "d3d12_xs", f"module suffix {collected[0]['module']}")
     print("exports: DLL, LIB, ordinal and CLI parsing passed")
 
 
@@ -180,6 +197,10 @@ def check_merge():
             == {"D3D12XLibOnly", "Shared", "D3D12XDllOnly"},
             f"merged exports {merged['d3d12_xs']['exports']}",
         )
+        fallback = coverage.load_exports([
+            {"file": "d3d12_xs.lib.txt", "exports": [{"name": "FromLib"}]}
+        ])
+        check(set(fallback) == {"d3d12_xs"}, f"fallback module key {set(fallback)}")
         inventory_path = directory / "exports.json"
         inventory_path.write_text(json.dumps(inventory), encoding="utf-8")
         def_path = directory / "d3d12_xs.def"
@@ -207,15 +228,31 @@ def check_unmeasured():
         collected = exports.collect_dumpbin(empty_capture, "dll")
         check(collected[0].get("error") == "no exports parsed", f"empty capture {collected}")
 
+        partial_capture = directory / "partial.txt"
+        partial_capture.write_text(
+            "Exports\nordinal hint RVA name\n"
+            "1 0 00001000 ParsedExport\n"
+            "this row cannot be parsed\n",
+            encoding="utf-8",
+        )
+        partial = exports.collect_dumpbin(partial_capture, "dll")[0]
+        check(partial["exports"] == [
+            {"ordinal": 1, "name": "ParsedExport", "rva": "0x1000"}
+        ], f"partial exports {partial['exports']}")
+        check(partial["error"] == "1 unparsed export line(s)", f"partial error {partial}")
+
         inventory = {
             "modules": [
-                {"module": "empty", "file": "empty.txt", "exports": [], "error": "no exports parsed"}
+                collected[0],
+                partial,
             ]
         }
         inventory_path = directory / "exports.json"
         inventory_path.write_text(json.dumps(inventory), encoding="utf-8")
         empty_def = directory / "empty.def"
         empty_def.write_text("LIBRARY empty\nEXPORTS\nAnything\n", encoding="utf-8")
+        partial_def = directory / "partial.def"
+        partial_def.write_text("LIBRARY partial\nEXPORTS\nParsedExport\n", encoding="utf-8")
         absent_def = directory / "absent.def"
         absent_def.write_text("LIBRARY absent\nEXPORTS\nAnything\n", encoding="utf-8")
         output = directory / "coverage.json"
@@ -223,6 +260,7 @@ def check_unmeasured():
         check(coverage.main([
             "--exports", str(inventory_path),
             "--def", "empty=" + str(empty_def),
+            "--def", "partial=" + str(partial_def),
             "--def", "absent=" + str(absent_def),
             "--json", str(output),
             "--markdown", str(markdown),
@@ -233,6 +271,10 @@ def check_unmeasured():
             for row in json.loads(output.read_text(encoding="utf-8"))
         }
         check(rows["empty"]["unmeasured"] == "no exports parsed", f"empty row {rows['empty']}")
+        check(
+            rows["partial"]["unmeasured"] == "1 unparsed export line(s)",
+            f"partial row {rows['partial']}",
+        )
         check(rows["absent"]["unmeasured"] == "no inventory entry", f"absent row {rows['absent']}")
         check("Unmeasured: no inventory entry" in markdown.read_text(encoding="utf-8"), "markdown status")
     print("exports: empty, absent and fail-on-missing rows passed")
